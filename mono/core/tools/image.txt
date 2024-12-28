@@ -1,0 +1,76 @@
+from asyncio import gather
+from io import BytesIO
+from math import sqrt
+from typing import List
+
+from discord import File
+from jishaku.functools import executor_function
+from wand.image import Image as WandImage
+
+from core.client.network import ClientSession
+
+
+@executor_function
+def __colage_open(buffer: BytesIO) -> WandImage:
+    with WandImage(file=buffer) as img:
+        img.format = "png"
+        img.resize(256, 256)
+        return img.clone()
+
+
+@executor_function
+def __colage_paste(background: WandImage, image: WandImage, x: int, y: int) -> None:
+    with image.clone() as img:
+        background.composite(img, left=x * 256, top=y * 256)
+
+
+async def collage(session: ClientSession, image_urls: List[str]) -> File:
+    buffers = []
+    for image_url in image_urls:
+        try:
+            response = await session.request(url=image_url, method="GET")
+            if response.status == 200 and response.content_type.startswith("image/"):
+                buffers.append(await response.read())
+            else:
+                print(
+                    f"Failed to retrieve image from {image_url}: Status {response.status}, Content-Type {response.content_type}"
+                )
+        except Exception as e:
+            print(f"Error retrieving image from {image_url}: {e}")
+
+    images: List[WandImage] = await gather(
+        *[
+            __colage_open(BytesIO(buffer))
+            for buffer in buffers
+            if isinstance(buffer, bytes)
+        ]
+    )
+
+    if not images:
+        raise ValueError("No images were retrieved to create a collage.")
+
+    rows = int(sqrt(len(images)))
+    columns = (len(images) + rows - 1) // rows
+
+    with WandImage(
+        width=columns * 256, height=rows * 256, background="transparent"
+    ) as background:
+        await gather(
+            *[
+                __colage_paste(background, image, index % columns, index // columns)
+                for index, image in enumerate(images)
+            ]
+        )
+
+        output = BytesIO()
+        background.format = "png"
+        background.save(file=output)
+
+    output.seek(0)
+    for image in images:
+        image.close()
+
+    return File(
+        output,
+        filename="collage.png",
+    )
